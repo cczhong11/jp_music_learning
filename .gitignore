@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local application data and personal media
+data/
+output/
+
+# Dependencies and local browser state
+node_modules/
+.playwright-cli/
+
+# OS and editor files
+.DS_Store
+*.swp
