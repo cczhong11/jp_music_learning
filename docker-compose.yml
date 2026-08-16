@@ -5,8 +5,10 @@ services:
       - .env
     environment:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-luna}
+      NAS_MUSIC_DIR: /music
     ports:
       - "3009:3000"
     volumes:
       - ./data:/data
+      - "${NAS_MUSIC_DIR:-./music}:/music:ro"
     restart: unless-stopped

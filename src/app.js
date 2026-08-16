@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, relative, resolve, sep } from "node:path";
 import KuroshiroModule from "kuroshiro";
 import KuromojiAnalyzer from "kuroshiro-analyzer-kuromoji";
 
@@ -15,8 +15,8 @@ const supportedAudioTypes = new Map([
   [".wav", "audio/wav"],
 ]);
 
-export function createServer({ dataDir, translator = translateLyricsWithOpenAI }) {
-  const store = createStore(dataDir, translator);
+export function createServer({ dataDir, translator = translateLyricsWithOpenAI, nasMusicDir = process.env.NAS_MUSIC_DIR || "/music" }) {
+  const store = createStore(dataDir, translator, nasMusicDir);
 
   return createHttpServer(async (request, response) => {
     try {
@@ -64,6 +64,13 @@ export function createServer({ dataDir, translator = translateLyricsWithOpenAI }
         return sendJson(response, 201, song);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/nas/songs") {
+        return sendJson(response, 200, store.listNasSongs());
+      }
+      if (request.method === "POST" && url.pathname === "/api/nas/import") {
+        return sendJson(response, 201, await store.importNasSongs(await readJson(request)));
+      }
+
       const progressMatch = url.pathname.match(/^\/api\/lyrics\/([\w-]+)\/practice$/);
       if (request.method === "POST" && progressMatch) {
         return sendJson(response, 200, store.recordPractice(progressMatch[1]));
@@ -105,7 +112,7 @@ export function createServer({ dataDir, translator = translateLyricsWithOpenAI }
   });
 }
 
-function createStore(dataDir, translator) {
+function createStore(dataDir, translator, nasMusicDir) {
   const mediaDir = join(dataDir, "media");
   const recordingsDir = join(dataDir, "recordings");
   mkdirSync(mediaDir, { recursive: true });
@@ -119,6 +126,7 @@ function createStore(dataDir, translator) {
       original_filename TEXT NOT NULL,
       media_filename TEXT NOT NULL,
       media_type TEXT NOT NULL,
+      source_path TEXT NOT NULL DEFAULT '',
       lyric_line_count INTEGER NOT NULL,
       created_at TEXT NOT NULL
     )
@@ -157,10 +165,11 @@ function createStore(dataDir, translator) {
     );
     INSERT OR IGNORE INTO preferences (singleton) VALUES (1)
   `);
+  if (!db.prepare("PRAGMA table_info(songs)").all().some((column) => column.name === "source_path")) db.exec("ALTER TABLE songs ADD COLUMN source_path TEXT NOT NULL DEFAULT ''");
 
   const insert = db.prepare(`
-    INSERT INTO songs (id, title, artist, original_filename, media_filename, media_type, lyric_line_count, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO songs (id, title, artist, original_filename, media_filename, media_type, source_path, lyric_line_count, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const list = db.prepare(`
     SELECT s.id, s.title, s.artist, s.original_filename AS originalFilename, s.media_type AS mediaType,
@@ -176,7 +185,7 @@ function createStore(dataDir, translator) {
     },
     health() {
       db.prepare("SELECT 1").get();
-      return { ok: true, storage: existsSync(mediaDir) };
+      return { ok: true, storage: existsSync(mediaDir), nasMusic: existsSync(nasMusicDir) };
     },
     getSong(id) {
       const song = db.prepare(`SELECT id, title, artist, media_type AS mediaType, lyric_line_count AS lyricLineCount FROM songs WHERE id = ?`).get(id);
@@ -185,8 +194,13 @@ function createStore(dataDir, translator) {
       return { ...song, lines };
     },
     getSongMedia(id) {
-      const media = db.prepare("SELECT media_filename AS filename, media_type AS type FROM songs WHERE id = ?").get(id);
-      return media && { ...media, path: join(mediaDir, media.filename) };
+      const media = db.prepare("SELECT media_filename AS filename, media_type AS type, source_path AS sourcePath FROM songs WHERE id = ?").get(id);
+      if (!media) return null;
+      if (media.sourcePath) {
+        const path = resolveInsideRoot(nasMusicDir, media.sourcePath);
+        return path && existsSync(path) ? { ...media, path, managed: false } : null;
+      }
+      return { ...media, path: join(mediaDir, media.filename), managed: true };
     },
     async addSong({ title, artist = "", audio, lyrics }) {
       if (!title?.trim()) throw new InputError("Song title is required.");
@@ -208,7 +222,7 @@ function createStore(dataDir, translator) {
       writeFileSync(temporaryPath, audio.data);
 
       try {
-        insert.run(id, title.trim(), artist.trim(), basename(audio.filename), mediaFilename, mediaType, lyricLineCount, new Date().toISOString());
+        insert.run(id, title.trim(), artist.trim(), basename(audio.filename), mediaFilename, mediaType, "", lyricLineCount, new Date().toISOString());
         const addLyric = db.prepare("INSERT INTO lyrics (id, song_id, position, start_seconds, text, kana, romaji) VALUES (?, ?, ?, ?, ?, ?, ?)");
         const enrichedLyrics = await Promise.all(parsedLyrics.map(async (line) => ({ ...line, ...await generateReadings(line.text) })));
         for (const [position, line] of enrichedLyrics.entries()) addLyric.run(randomUUID(), id, position, line.startSeconds, line.text, line.kana, line.romaji);
@@ -218,6 +232,45 @@ function createStore(dataDir, translator) {
       }
 
       return list.all().find((song) => song.id === id);
+    },
+    listNasSongs() {
+      const importedPaths = new Set(db.prepare("SELECT source_path AS sourcePath FROM songs WHERE source_path <> ''").all().map((row) => row.sourcePath.toLowerCase()));
+      const importedFilenames = new Set(db.prepare("SELECT original_filename AS filename FROM songs").all().map((row) => row.filename.toLowerCase()));
+      return scanNasMusic(nasMusicDir).map((candidate) => ({
+        id: candidate.id,
+        title: candidate.title,
+        directory: candidate.directory,
+        audioFilename: candidate.audioFilename,
+        lrcFilename: candidate.lrcFilename,
+        imported: importedPaths.has(candidate.audioRelativePath.toLowerCase()) || importedFilenames.has(candidate.audioFilename.toLowerCase()),
+      }));
+    },
+    async importNasSongs({ ids, artist = "" }) {
+      if (!Array.isArray(ids) || !ids.length || ids.length > 100 || ids.some((id) => typeof id !== "string")) throw new InputError("Select between 1 and 100 NAS songs to import.");
+      const requestedIds = [...new Set(ids)];
+      const candidates = new Map(scanNasMusic(nasMusicDir).map((candidate) => [candidate.id, candidate]));
+      const importedPaths = new Set(db.prepare("SELECT source_path AS sourcePath FROM songs WHERE source_path <> ''").all().map((row) => row.sourcePath.toLowerCase()));
+      const importedFilenames = new Set(db.prepare("SELECT original_filename AS filename FROM songs").all().map((row) => row.filename.toLowerCase()));
+      let importedCount = 0, skippedCount = 0;
+      for (const candidateId of requestedIds) {
+        const candidate = candidates.get(candidateId);
+        if (!candidate) throw new InputError("A selected NAS song is no longer available.");
+        if (importedPaths.has(candidate.audioRelativePath.toLowerCase()) || importedFilenames.has(candidate.audioFilename.toLowerCase())) { skippedCount++; continue; }
+        const parsedLyrics = parseLrc(readFileSync(candidate.lrcAbsolutePath, "utf8"));
+        const enrichedLyrics = await Promise.all(parsedLyrics.map(async (line) => ({ ...line, ...await generateReadings(line.text) })));
+        const songId = randomUUID();
+        db.exec("BEGIN");
+        try {
+          insert.run(songId, candidate.title, String(artist).trim(), candidate.audioFilename, candidate.audioFilename, candidate.mediaType, candidate.audioRelativePath, enrichedLyrics.length, new Date().toISOString());
+          const addLyric = db.prepare("INSERT INTO lyrics (id, song_id, position, start_seconds, text, kana, romaji) VALUES (?, ?, ?, ?, ?, ?, ?)");
+          for (const [position, line] of enrichedLyrics.entries()) addLyric.run(randomUUID(), songId, position, line.startSeconds, line.text, line.kana, line.romaji);
+          db.exec("COMMIT");
+        } catch (error) { db.exec("ROLLBACK"); throw error; }
+        importedPaths.add(candidate.audioRelativePath.toLowerCase());
+        importedFilenames.add(candidate.audioFilename.toLowerCase());
+        importedCount++;
+      }
+      return { importedCount, skippedCount };
     },
     async ensureReadings(songId) {
       const lines = db.prepare("SELECT id, text FROM lyrics WHERE song_id = ? AND (kana = '' OR romaji = '') ORDER BY position").all(songId);
@@ -292,7 +345,7 @@ function createStore(dataDir, translator) {
         db.prepare("DELETE FROM lyrics WHERE song_id = ?").run(id);
         db.prepare("DELETE FROM songs WHERE id = ?").run(id);
         db.exec("COMMIT");
-        rmSync(media.path, { force: true });
+      if (media.managed) rmSync(media.path, { force: true });
         for (const recording of recordings) rmSync(join(recordingsDir, recording.filename), { force: true });
       } catch (error) { db.exec("ROLLBACK"); throw error; }
     },
@@ -320,6 +373,51 @@ function createStore(dataDir, translator) {
       rmSync(recording.path, { force: true });
     },
   };
+}
+
+function resolveInsideRoot(root, relativePath) {
+  const rootPath = resolve(root);
+  const target = resolve(rootPath, relativePath);
+  return target === rootPath || target.startsWith(`${rootPath}${sep}`) ? target : null;
+}
+
+function scanNasMusic(root) {
+  if (!root || !existsSync(root)) return [];
+  const rootPath = resolve(root);
+  const pairs = new Map();
+  const directories = [rootPath];
+  let visitedEntries = 0;
+  while (directories.length) {
+    const directoryPath = directories.pop();
+    let entries;
+    try { entries = readdirSync(directoryPath, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (++visitedEntries > 50_000) throw new InputError("The NAS music folder contains too many files to scan safely.");
+      const absolutePath = join(directoryPath, entry.name);
+      if (entry.isDirectory()) { directories.push(absolutePath); continue; }
+      if (!entry.isFile()) continue;
+      const extension = extname(entry.name).toLowerCase();
+      if (extension !== ".lrc" && !supportedAudioTypes.has(extension)) continue;
+      const directory = relative(rootPath, directoryPath).split(sep).join("/");
+      const base = basename(entry.name, extension);
+      const key = `${directory}/${base}`.toLowerCase();
+      const pair = pairs.get(key) || { directory, base };
+      if (extension === ".lrc") {
+        pair.lrcFilename = entry.name;
+        pair.lrcAbsolutePath = absolutePath;
+      } else if (!pair.audioAbsolutePath) {
+        pair.audioFilename = entry.name;
+        pair.audioAbsolutePath = absolutePath;
+        pair.audioRelativePath = relative(rootPath, absolutePath).split(sep).join("/");
+        pair.mediaType = supportedAudioTypes.get(extension);
+      }
+      pairs.set(key, pair);
+    }
+  }
+  return [...pairs.values()]
+    .filter((pair) => pair.audioAbsolutePath && pair.lrcAbsolutePath)
+    .map((pair) => ({ ...pair, id: Buffer.from(pair.audioRelativePath).toString("base64url"), title: pair.base.replace(/^[0-9]+[\s._-]+/, "") || pair.base }))
+    .sort((a, b) => `${a.directory}/${a.audioFilename}`.localeCompare(`${b.directory}/${b.audioFilename}`));
 }
 
 function countTimedLyrics(text) {
@@ -489,11 +587,12 @@ function libraryPage() {
 :root{color-scheme:dark;--bg:#050b18;--panel:#0b1425;--panel2:#101b2f;--line:#26334a;--text:#f4f6ff;--muted:#909bb2;--purple:#9b7cff;--purple2:#6f55e8;--coral:#ff6d69}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 48% 20%,#14203b 0,#070e1c 36%,#030812 100%);color:var(--text);font:15px Inter,"Noto Sans SC","Noto Sans JP",system-ui,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:1px solid transparent;border-radius:10px;padding:11px 16px;background:linear-gradient(135deg,var(--purple2),var(--purple));color:white;transition:.18s ease}button:hover{transform:translateY(-1px);filter:brightness(1.08)}button:disabled{cursor:not-allowed;opacity:.45;transform:none;filter:none}button.secondary{background:#111c30;border-color:var(--line)}button.ghost{background:transparent;border-color:var(--line);color:#c8d0e2}.card{background:linear-gradient(145deg,rgba(17,27,47,.96),rgba(8,16,30,.96));border:1px solid var(--line);border-radius:14px;padding:18px;margin:14px 0;box-shadow:0 18px 50px rgba(0,0,0,.16)}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.stack{display:grid;gap:12px}.muted{color:var(--muted)}label{display:grid;gap:6px;color:#c8d0df}input,textarea,select{width:100%;background:#0b1425;color:white;border:1px solid var(--line);border-radius:9px;padding:10px 12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--purple)}
 body.library-page main{max-width:1040px;margin:auto;padding:42px 24px}body.library-page h1{font-size:32px;margin:0 0 22px}.library-page .card{padding:24px}.library-page form.stack,.library-page section.stack{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.library-page form.stack button,.library-page form.stack p,.library-page section.stack h2,.library-page section.stack button,.library-page section.stack p{grid-column:1/-1}
+.nas-toolbar{display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end}.nas-actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}.nas-list{display:grid;gap:7px;max-height:420px;overflow:auto}.nas-item{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1527}.nas-item.imported{opacity:.55}.nas-item input{width:18px;height:18px}.nas-path{display:block;color:var(--muted);font-size:12px;margin-top:4px}.nas-state{color:#9eabd0;font-size:13px}
 body.practice-page{overflow:hidden}body.practice-page main{max-width:none;height:100vh;padding:0}.practice-shell{height:100vh;padding:12px;display:grid;grid-template-columns:270px minmax(520px,1fr) 280px;gap:12px}.practice-panel{min-width:0;background:linear-gradient(155deg,rgba(10,19,35,.97),rgba(5,12,24,.97));border:1px solid var(--line);border-radius:14px}.song-sidebar,.settings-panel{padding:20px;overflow:auto}.brand{display:flex;align-items:center;justify-content:space-between;font-size:19px;font-weight:750;margin:2px 0 22px}.search-box{margin-bottom:22px}.sidebar-caption{display:flex;justify-content:space-between;color:#c9d0df;margin-bottom:8px}.song-nav{display:grid;gap:4px}.song-nav-item{display:block;width:100%;padding:13px 11px;background:transparent;border:0;border-bottom:1px solid rgba(38,51,74,.65);text-align:left;color:#bac3d5}.song-nav-item:hover{transform:none;background:#101b30}.song-nav-item.active{background:linear-gradient(130deg,rgba(111,85,232,.24),rgba(22,34,58,.7));border:1px solid #354463;border-radius:11px;color:white}.song-nav-top{display:flex;justify-content:space-between;gap:8px}.mini-progress{height:3px;background:#1f2b40;border-radius:8px;margin-top:10px;overflow:hidden}.mini-progress i{display:block;height:100%;background:linear-gradient(90deg,var(--purple2),#b38cff)}.sidebar-import{width:100%;margin-top:18px}.progress-card{margin-top:24px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#0c1729}.progress-ring{width:72px;height:72px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--purple) var(--value),#233047 0);position:relative;font-size:18px}.progress-ring:before{content:"";position:absolute;inset:8px;background:#0c1729;border-radius:50%}.progress-ring span{position:relative}
 .practice-center{padding:20px 22px;overflow:auto}.center-head{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:14px}.song-title{font-size:24px;font-weight:730}.back-btn{font-size:24px;padding:7px 12px}.song-switcher{display:flex;gap:8px}.song-switcher button{white-space:nowrap}.view-tabs{max-width:430px;margin:0 auto 18px;padding:4px;display:grid;grid-template-columns:1fr 1fr;background:#0a1426;border:1px solid #202d43;border-radius:999px}.view-tabs button{border:0;border-radius:999px;background:transparent;color:#aeb8cc}.view-tabs button.active{color:#cdbfff;background:radial-gradient(circle,#2a2858,#101a30);box-shadow:inset 0 -2px #9b7cff}.phrase-card{position:relative;text-align:center;min-height:315px;padding:18px 34px 30px;display:flex;flex-direction:column;justify-content:flex-start;border:1px solid #26344b;border-radius:15px;background:radial-gradient(circle at 50% 45%,rgba(41,48,82,.45),rgba(9,17,32,.82));overflow:hidden}.phrase-meta{position:static;width:100%;display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;color:#a9b3c7;margin-bottom:24px}.phrase-actions{margin-left:auto}.phrase-badge{padding:8px 12px;border-radius:8px;background:rgba(120,99,220,.2);color:#cbbfff}.kana-display{font-size:18px;letter-spacing:.2em;color:#d8deec;margin:0 0 6px}.phrase-text{font-size:clamp(34px,4.4vw,64px);font-weight:650;line-height:1.25;letter-spacing:.035em;margin:0 auto 22px;max-width:1000px}.translation-display{width:100%;border-top:1px dashed #2c3a50;padding-top:20px;font-size:23px;color:#d8ddea}.romaji-display{margin-top:10px;font-size:18px;letter-spacing:.12em;font-style:italic;color:#7f8ba5}.sentence-nav{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;margin:12px 0 0}.sentence-nav button:first-child{justify-self:start}.sentence-nav button:last-child{justify-self:end}.sentence-position{color:#8f9bb2;font-variant-numeric:tabular-nums}.timeline-card{padding:15px;margin:12px 0 18px;border:1px solid var(--line);border-radius:14px;background:#091426}.timeline-meta{display:flex;justify-content:space-between;color:#aeb8c9;font-size:12px}.waveform{height:66px;display:flex;align-items:center;gap:2px;border-bottom:1px solid #27344a;overflow:hidden}.waveform span{flex:1;min-width:2px;border-radius:2px;background:#536078;opacity:.65}.waveform span.hot{background:linear-gradient(#a98cff,#7158e9);opacity:1}.control-row{display:grid;grid-template-columns:1.25fr 1fr .9fr .9fr 1.1fr;gap:12px}.control-row button,.control-row select{height:58px}.control-row .record-btn{background:linear-gradient(135deg,#a44144,#e96863);border-color:#ff817a}.control-hint{text-align:center;color:#68758e;font-size:13px;margin:14px 0 4px}.recording-stage{margin-top:18px;min-height:115px;padding:20px;display:flex;align-items:center;gap:20px;border:1px solid var(--line);border-radius:14px;background:#0b1629}.record-state{min-width:130px;font-size:18px}.record-state small{display:block;color:#96a1b7;margin-top:8px}.record-wave{display:flex;align-items:center;gap:3px;flex:1;height:58px}.record-wave i{width:3px;border-radius:4px;background:#ff716b}.record-list{display:grid;gap:8px;width:100%}.record-list .row{justify-content:space-between}.record-list audio{max-width:70%}
 .settings-panel h2{margin:0 0 22px;font-size:18px}.setting-group{padding:19px 0;border-top:1px solid #202d42}.setting-group h3{margin:0 0 16px;font-size:14px}.setting-row{display:grid;grid-template-columns:1fr 120px;align-items:center;gap:12px;margin:12px 0}.switch-row{display:flex;align-items:center;justify-content:space-between;margin:16px 0}.toggle{width:48px;height:26px;padding:0;border:0;background:#253149;border-radius:99px;position:relative}.toggle:after{content:"";position:absolute;width:20px;height:20px;left:3px;top:3px;border-radius:50%;background:white;transition:.2s}.toggle.on{background:linear-gradient(90deg,#7558e5,#ab8cff)}.toggle.on:after{left:25px}.ai-translate{background:linear-gradient(135deg,#214c72,#7059df);border-color:#6984d7}.translation-status{min-height:22px;text-align:center;color:#9eabd0;margin:-8px 0 8px}.mode-option{display:flex;gap:10px;align-items:flex-start;margin:15px 0;color:#d6dced}.mode-option i{width:20px;height:20px;border:2px solid #67748e;border-radius:50%;margin-top:2px}.mode-option.active i{border:6px solid var(--purple)}.mode-option small{display:block;color:#7f8ba4;margin-top:2px}.full-lyrics{display:grid;gap:7px;max-height:calc(100vh - 150px);overflow:auto;padding-right:6px}.lyric-row{width:100%;text-align:left;background:#0e192b;border:1px solid transparent;color:#d5dbea;padding:13px 15px}.lyric-row:hover,.lyric-row.active{transform:none;border-color:#8069e8;background:#171f3b}.lyric-romaji,.lyric-translation{display:block;color:#7f8ba4;font-size:12px;margin-top:5px}.lyric-translation{color:#aeb9d2}
 @media(max-width:1180px){body.practice-page{overflow:auto}body.practice-page main,.practice-shell{height:auto;min-height:100vh}.practice-shell{grid-template-columns:230px minmax(0,1fr)}.settings-panel{grid-column:2}.control-row{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:760px){body.library-page main{padding:20px 14px}.library-page form.stack,.library-page section.stack{grid-template-columns:1fr}.practice-shell{display:block;padding:0}.practice-panel{border-radius:0;border-left:0;border-right:0}.song-sidebar{max-height:300px}.practice-center{padding:16px}.settings-panel{margin-top:10px}.center-head{align-items:flex-start;flex-wrap:wrap}.song-switcher{width:100%;display:grid;grid-template-columns:1fr 1fr}.song-switcher button:last-child{grid-column:1/-1}.phrase-card{min-height:280px;padding:16px 18px 24px}.phrase-meta{align-items:flex-start;margin-bottom:22px}.phrase-actions{width:100%;justify-content:flex-start;margin-left:0}.phrase-text{font-size:34px}.sentence-nav button{min-height:44px}.control-row{grid-template-columns:1fr 1fr}.control-row .record-btn{grid-column:1/-1}.recording-stage{align-items:flex-start;flex-wrap:wrap}.view-tabs{margin-top:12px}}
+@media(max-width:760px){body.library-page main{padding:20px 14px}.library-page form.stack,.library-page section.stack{grid-template-columns:1fr}.nas-toolbar{grid-template-columns:1fr}.nas-item{grid-template-columns:auto 1fr}.nas-state{grid-column:2}.practice-shell{display:block;padding:0}.practice-panel{border-radius:0;border-left:0;border-right:0}.song-sidebar{max-height:300px}.practice-center{padding:16px}.settings-panel{margin-top:10px}.center-head{align-items:flex-start;flex-wrap:wrap}.song-switcher{width:100%;display:grid;grid-template-columns:1fr 1fr}.song-switcher button:last-child{grid-column:1/-1}.phrase-card{min-height:280px;padding:16px 18px 24px}.phrase-meta{align-items:flex-start;margin-bottom:22px}.phrase-actions{width:100%;justify-content:flex-start;margin-left:0}.phrase-text{font-size:34px}.sentence-nav button{min-height:44px}.control-row{grid-template-columns:1fr 1fr}.control-row .record-btn{grid-column:1/-1}.recording-stage{align-items:flex-start;flex-wrap:wrap}.view-tabs{margin-top:12px}}
 </style><main id="app"></main><script>
 const app=document.querySelector('#app');let state={song:null,index:0,prefs:null,audio:null,looping:false,recorder:null,chunks:[],blob:null};
 async function api(path,options){const response=await fetch(path,options);const type=response.headers.get('content-type')||'';const data=type.includes('json')?await response.json():null;if(!response.ok)throw new Error(data&&data.error||'请求失败');return data}
@@ -510,6 +609,15 @@ async function showLibrary(){
   const folderLabel=node('label','选择包含同名音频和 LRC 的文件夹'),folderInput=document.createElement('input');folderInput.type='file';folderInput.multiple=true;folderInput.setAttribute('webkitdirectory','');folderInput.accept='.m4a,.mp3,.wav,.lrc,audio/mp4,audio/mpeg,audio/wav,text/plain';folderLabel.append(folderInput);folderCard.append(folderLabel);
   const batchArtistLabel=node('label','歌手（应用到本次导入的所有歌曲）'),batchArtist=document.createElement('input');batchArtist.placeholder='例如：YOASOBI';batchArtistLabel.append(batchArtist);folderCard.append(batchArtistLabel);
   const folderMessage=node('p');folderCard.append(button('导入文件夹',()=>importFolder(folderInput.files,batchArtist.value,folderMessage)),folderMessage);app.append(folderCard);
+
+  const nasCard=card();nasCard.classList.add('nas-card');nasCard.append(node('h2','从 NAS 选择歌曲'));
+  const nasDescription=node('p','扫描 Docker 只读挂载的音乐目录，只导入你勾选的歌曲，不复制音频文件。');nasDescription.className='muted';nasCard.append(nasDescription);
+  const nasToolbar=node('div');nasToolbar.className='nas-toolbar';const nasFilterLabel=node('label','筛选歌曲'),nasFilter=document.createElement('input');nasFilter.placeholder='歌曲名、文件夹或文件名';nasFilterLabel.append(nasFilter);const nasArtistLabel=node('label','歌手（应用到本次选择）'),nasArtist=document.createElement('input');nasArtist.placeholder='例如：YOASOBI';nasArtistLabel.append(nasArtist);const scanNasButton=button('扫描 NAS',scanNasSongs,'secondary');nasToolbar.append(nasFilterLabel,nasArtistLabel,scanNasButton);nasCard.append(nasToolbar);
+  const nasActions=node('div');nasActions.className='nas-actions';const selectVisibleButton=button('勾选当前结果',()=>{nasList.querySelectorAll('input[type="checkbox"]:not(:disabled)').forEach(input=>input.checked=true)},'ghost'),clearNasButton=button('清除选择',()=>{nasList.querySelectorAll('input[type="checkbox"]').forEach(input=>input.checked=false)},'ghost'),importNasButton=button('导入选中的歌曲',importSelectedNasSongs);nasActions.append(selectVisibleButton,clearNasButton,importNasButton);nasCard.append(nasActions);const nasMessage=node('p','尚未扫描 NAS 音乐目录。');nasMessage.className='nas-state';const nasList=node('div');nasList.className='nas-list';nasCard.append(nasMessage,nasList);app.append(nasCard);let nasCandidates=[];
+  nasFilter.oninput=renderNasCandidates;
+  async function scanNasSongs(){scanNasButton.disabled=true;scanNasButton.textContent='扫描中…';nasMessage.textContent='正在扫描 NAS 中同名的音频和 LRC…';try{nasCandidates=await api('/api/nas/songs');renderNasCandidates()}catch(error){nasMessage.textContent='扫描失败：'+error.message}finally{scanNasButton.disabled=false;scanNasButton.textContent='重新扫描 NAS'}}
+  function renderNasCandidates(){const query=nasFilter.value.trim().toLowerCase(),visible=nasCandidates.filter(candidate=>(candidate.title+' '+candidate.directory+' '+candidate.audioFilename).toLowerCase().includes(query));nasList.replaceChildren();for(const candidate of visible){const row=node('label');row.className='nas-item '+(candidate.imported?'imported':'');const check=document.createElement('input');check.type='checkbox';check.value=candidate.id;check.disabled=candidate.imported;const copy=node('span');copy.append(node('strong',candidate.title));const path=node('span',(candidate.directory?candidate.directory+'/':'')+candidate.audioFilename+' ＋ '+candidate.lrcFilename);path.className='nas-path';copy.append(path);row.append(check,copy,node('span',candidate.imported?'已导入':'可选择'));nasList.append(row)}const available=nasCandidates.filter(candidate=>!candidate.imported).length;nasMessage.textContent=nasCandidates.length?'找到 '+nasCandidates.length+' 组歌曲，'+available+' 组尚未导入；当前显示 '+visible.length+' 组。':'没有找到同名配对的音频和 LRC，请检查 NAS 挂载。'}
+  async function importSelectedNasSongs(){const ids=[...nasList.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.value);if(!ids.length){nasMessage.textContent='请先勾选要导入的歌曲。';return}importNasButton.disabled=true;importNasButton.textContent='正在导入 '+ids.length+' 首…';try{const result=await api('/api/nas/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({ids,artist:nasArtist.value})});nasCandidates=await api('/api/nas/songs');renderNasCandidates();nasMessage.textContent='完成：只导入了所选的 '+result.importedCount+' 首，跳过 '+result.skippedCount+' 首。';await renderSongs()}catch(error){nasMessage.textContent='导入失败：'+error.message}finally{importNasButton.disabled=false;importNasButton.textContent='导入选中的歌曲'}}
 
   const list=card();list.append(node('h2','你的歌曲'));app.append(list);
   async function renderSongs(){list.replaceChildren(node('h2','你的歌曲'));const songs=await api('/api/songs');if(!songs.length)list.append(node('p','还没有歌曲。'));for(const song of songs){const row=node('div');row.className='row card';row.append(node('strong',song.title),node('span','— '+(song.artist||'未知歌手')),node('span',(song.practicedLineCount||0)+' / '+song.lyricLineCount+' 已练习'),button('练习',()=>location.hash='song/'+song.id));list.append(row)}return songs}

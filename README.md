@@ -36,6 +36,7 @@
    ```dotenv
    OPENAI_API_KEY=your_api_key
    OPENAI_MODEL=gpt-5.6-luna
+   NAS_MUSIC_DIR=/volume1/music
    ```
 
 3. 部署：
@@ -82,6 +83,23 @@ YOASOBI/
 ```
 
 在歌曲库选择“导入整个文件夹”，应用会自动配对文件、导入新歌曲并跳过已经存在的音频文件。
+
+### 从 NAS 选择性导入
+
+`NAS_MUSIC_DIR` 指向 NAS 宿主机上的音乐目录。Docker 会将它只读挂载到容器的 `/music`：
+
+```dotenv
+NAS_MUSIC_DIR=/volume1/music
+```
+
+在歌曲库中：
+
+1. 点击“扫描 NAS”。
+2. 搜索或浏览同名配对的音频与 LRC。
+3. 只勾选需要加入学习库的歌曲。
+4. 点击“导入选中的歌曲”。
+
+未勾选的歌曲不会写入 SQLite。NAS 音频保持在原目录，应用只保存只读引用，不会复制第二份；删除学习库中的 NAS 歌曲也不会删除原始音乐文件。
 
 ## OpenAI 自动翻译
 

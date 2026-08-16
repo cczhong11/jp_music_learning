@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -106,4 +106,52 @@ test("user can upload an M4A song and find it in the song library", async (t) =>
   const [listed] = await library.json();
   assert.equal(listed.id, created.id);
   assert.equal(listed.practicedLineCount, 1);
+});
+
+test("user can scan a NAS folder and import only selected songs", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "jp-song-shadowing-data-"));
+  const nasMusicDir = await mkdtemp(join(tmpdir(), "jp-song-shadowing-nas-"));
+  const albumDir = join(nasMusicDir, "YOASOBI", "Album");
+  await mkdir(albumDir, { recursive: true });
+  await Promise.all([
+    writeFile(join(albumDir, "01 First.m4a"), m4aFixture()),
+    writeFile(join(albumDir, "01 First.lrc"), "[00:01.00]最初の歌詞\n[00:04.00]次の歌詞"),
+    writeFile(join(albumDir, "02 Second.m4a"), m4aFixture()),
+    writeFile(join(albumDir, "02 Second.lrc"), "[00:02.00]別の歌詞\n[00:05.00]最後の歌詞"),
+  ]);
+
+  const server = createServer({ dataDir, nasMusicDir });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address();
+  t.after(async () => {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await Promise.all([rm(dataDir, { recursive: true, force: true }), rm(nasMusicDir, { recursive: true, force: true })]);
+  });
+
+  const candidatesResponse = await fetch(`http://127.0.0.1:${port}/api/nas/songs`);
+  assert.equal(candidatesResponse.status, 200);
+  const candidates = await candidatesResponse.json();
+  assert.equal(candidates.length, 2);
+  assert.equal(candidates[0].directory, "YOASOBI/Album");
+  assert.equal(candidates[0].imported, false);
+
+  const importedResponse = await fetch(`http://127.0.0.1:${port}/api/nas/import`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ids: [candidates[1].id], artist: "YOASOBI" }),
+  });
+  assert.equal(importedResponse.status, 201);
+  assert.deepEqual(await importedResponse.json(), { importedCount: 1, skippedCount: 0 });
+
+  const songs = await fetch(`http://127.0.0.1:${port}/api/songs`).then((response) => response.json());
+  assert.equal(songs.length, 1);
+  assert.equal(songs[0].title, "Second");
+  assert.equal(songs[0].artist, "YOASOBI");
+  const media = await fetch(`http://127.0.0.1:${port}/api/songs/${songs[0].id}/media`);
+  assert.equal(media.status, 200);
+  assert.ok((await media.arrayBuffer()).byteLength > 1_000_000);
+  const rescanned = await fetch(`http://127.0.0.1:${port}/api/nas/songs`).then((response) => response.json());
+  assert.equal(rescanned.filter((candidate) => candidate.imported).length, 1);
+  await fetch(`http://127.0.0.1:${port}/api/songs/${songs[0].id}`, { method: "DELETE" });
+  await access(join(albumDir, "02 Second.m4a"));
 });

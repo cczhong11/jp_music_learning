@@ -6,6 +6,7 @@
 # Local application data and personal media
 data/
 output/
+music/
 
 # Dependencies and local browser state
 node_modules/
