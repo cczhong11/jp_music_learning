@@ -6,7 +6,7 @@ services:
     environment:
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-luna}
     ports:
-      - "3001:3000"
+      - "3009:3000"
     volumes:
       - ./data:/data
     restart: unless-stopped
