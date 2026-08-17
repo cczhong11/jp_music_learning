@@ -4,7 +4,7 @@ import { createServer } from "./app.js";
 
 const dataDir = resolve(process.env.DATA_DIR ?? "./data");
 mkdirSync(dataDir, { recursive: true });
-const port = Number(process.env.PORT ?? 3000);
+const port = Number(process.env.PORT ?? 3010);
 createServer({ dataDir }).listen(port, () => {
   console.log(`Japanese song shadowing app listening on http://localhost:${port}`);
 });
